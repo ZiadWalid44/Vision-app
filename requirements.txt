@@ -2,6 +2,4 @@ streamlit
 streamlit-webrtc
 ultralytics
 opencv-python-headless
-torch
-torchvision
 av
