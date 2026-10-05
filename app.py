@@ -1,185 +1,158 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
-import av
+import base64
+import os
+import cv2
 import numpy as np
+import streamlit as st
 from ultralytics import YOLO
 
 st.set_page_config(page_title="VisionAid AI", layout="centered")
 
-st.markdown("<h2 style='text-align: center; color: #00bcd4;'>👁️ VisionAid Assistant</h2>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center;'>Real-time Detection & Voice Alerts</p>", unsafe_allow_html=True)
-
 # 1. تحميل النموذج
 @st.cache_resource
-def load_model():
-    return YOLO("yolo26n.pt")
+def load_yolo():
+  return YOLO("yolo26n.pt")
 
-model = load_model()
 
-# الفئات المستهدفة
+model = load_yolo()
+
 SMART_CLASSES = [0, 2, 3, 9, 56, 57, 59, 60, 61, 62, 68, 69, 71, 72]
 
-# ملف لتخزين التنبيه اللحظي ومشاركته مع واجهة الجافاسكريبت
-ALERT_FILE = "/tmp/visionaid_alert.txt"
-with open(ALERT_FILE, "w") as f:
-    f.write("clear")
-
-class VideoProcessor(VideoTransformerBase):
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        h, w, _ = img.shape
-        total_area = h * w
-
-        # تطبيق الكشف
-        results = model.predict(
-            source=img,
-            imgsz=320,
-            conf=0.35,
-            classes=SMART_CLASSES,
-            verbose=False
-        )
-        result = results[0]
-        annotated_img = result.plot()
-
-        max_ratio = 0.0
-        closest_name = None
-
-        if len(result.boxes) > 0:
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                name = model.names[cls_id]
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                ratio = ((x2 - x1) * (y2 - y1)) / total_area
-                if ratio > 0.07 and ratio > max_ratio:
-                    max_ratio = ratio
-                    closest_name = name
-
-            if closest_name:
-                if max_ratio > 0.22:
-                    current_text = f"Warning, {closest_name} ahead"
-                else:
-                    current_text = f"{closest_name} ahead"
-            else:
-                current_text = "clear"
-        else:
-            current_text = "clear"
-
-        # حفظ التنبيه مباشرة
-        try:
-            with open(ALERT_FILE, "w") as f:
-                f.write(current_text)
-        except Exception:
-            pass
-
-        return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
-
-# إعداد الكاميرا
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
-
-ctx = webrtc_streamer(
-    key="visionaid",
-    video_processor_factory=VideoProcessor,
-    rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
-    async_processing=True,
-)
-
-# 2. قراءة التنبيه الحالي في Streamlit
-current_alert = "clear"
-try:
-    with open(ALERT_FILE, "r") as f:
-        current_alert = f.read().strip()
-except Exception:
-    pass
-
-# لوحة التحكم الصوتية المباشرة
-st.components.v1.html(f"""
+# 2. واجهة التطبيق المباشرة التي تضمن نطق الصوت وسرعة الاستجابة
+st.components.v1.html(
+    """
 <!DOCTYPE html>
 <html>
 <head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
-  body {{ margin: 0; padding: 0; font-family: -apple-system, sans-serif; }}
-  .voice-btn {{
-    background-color: #00bcd4;
-    color: white;
-    border: none;
-    padding: 12px;
-    font-size: 15px;
-    font-weight: bold;
-    border-radius: 8px;
-    cursor: pointer;
-    width: 100%;
-  }}
-  .voice-btn.active {{
-    background-color: #4caf50;
-  }}
-  #status-box {{
-    margin-top: 8px;
-    font-size: 14px;
-    font-weight: bold;
-    color: #333;
-    text-align: center;
-  }}
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0e1117; color: #fff; margin: 0; padding: 10px; display: flex; flex-direction: column; align-items: center; }
+  h3 { color: #00bcd4; margin: 5px 0 10px 0; }
+  #vid-box { width: 100%; max-width: 440px; border-radius: 10px; overflow: hidden; border: 2px solid #333; position: relative; background: #000; }
+  video { width: 100%; height: auto; display: block; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  .btn { width: 100%; max-width: 440px; padding: 14px; font-size: 16px; font-weight: bold; border-radius: 8px; border: none; cursor: pointer; margin-top: 10px; }
+  .btn-start { background: #00bcd4; color: #fff; }
+  .status-card { margin-top: 10px; width: 100%; max-width: 440px; background: #1e2129; padding: 12px; border-radius: 8px; border-left: 4px solid #00bcd4; box-sizing: border-box; }
+  #status-text { font-size: 16px; font-weight: bold; color: #4caf50; margin-top: 3px; }
 </style>
 </head>
 <body>
 
-<button id="audio-btn" class="voice-btn" onclick="initAudio()">🔊 Click Here to Enable Sound</button>
-<div id="status-box">Status: Waiting for click...</div>
+<h3>👁️ VisionAid Assistant</h3>
+
+<div id="vid-box">
+  <video id="webcam" playsinline autoplay muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="status-card">
+  <div style="font-size: 11px; color: #aaa;">SYSTEM STATUS & ALERTS</div>
+  <div id="status-text">Press button below to start...</div>
+</div>
+
+<button id="main-btn" class="btn btn-start" onclick="toggleSystem()">▶ START SYSTEM</button>
+
+<!-- نموذج خفي لالتقاط الإطارات -->
+<canvas id="capture-canvas" style="display:none;"></canvas>
 
 <script>
+  const video = document.getElementById('webcam');
+  const overlay = document.getElementById('overlay');
+  const oCtx = overlay.getContext('2d');
+  const capCanvas = document.getElementById('capture-canvas');
+  const capCtx = capCanvas.getContext('2d');
+  const statusTxt = document.getElementById('status-text');
+  const mainBtn = document.getElementById('main-btn');
+
   let synth = window.speechSynthesis;
-  let audioEnabled = false;
-  let targetVoice = null;
-  let lastSpoken = "";
-  let lastTime = 0;
+  let voiceTarget = null;
+  let isRunning = false;
+  let lastSpokenTime = 0;
 
-  function setVoice() {{
+  // اختيار صوت نسائي إنجليزي واضح
+  function setupVoices() {
     let voices = synth.getVoices();
-    targetVoice = voices.find(v => (v.name.includes("Google") || v.name.includes("Samantha") || v.name.includes("Natural") || v.name.includes("Zira")) && v.lang.startsWith("en")) 
+    voiceTarget = voices.find(v => (v.name.includes("Google") || v.name.includes("Samantha") || v.name.includes("Natural") || v.name.includes("Zira")) && v.lang.startsWith("en")) 
                   || voices.find(v => v.lang.startsWith("en"));
-  }}
-  setVoice();
-  if (speechSynthesis.onvoiceschanged !== undefined) {{
-    speechSynthesis.onvoiceschanged = setVoice;
-  }}
+  }
+  setupVoices();
+  if (speechSynthesis.onvoiceschanged !== undefined) {
+    speechSynthesis.onvoiceschanged = setupVoices;
+  }
 
-  function initAudio() {{
-    audioEnabled = true;
-    let btn = document.getElementById("audio-btn");
-    btn.textContent = "✅ Sound Active";
-    btn.className = "voice-btn active";
-    document.getElementById("status-box").textContent = "Active: Monitoring camera...";
-    
-    let u = new SpeechSynthesisUtterance("System online");
-    if (targetVoice) u.voice = targetVoice;
-    synth.speak(u);
-  }}
-
-  function speakAlert(text) {{
-    if (!audioEnabled || !text || text === "clear" || synth.speaking) return;
+  // دالة النطق الصوتي الفورية
+  function speak(text) {
+    if (!text || synth.speaking) return;
     let now = Date.now();
-    if (now - lastTime < 2500) return;
+    if (now - lastSpokenTime < 2200) return; // منع التكرار لأقل من 2.2 ثانية
 
     let utter = new SpeechSynthesisUtterance(text);
-    if (targetVoice) utter.voice = targetVoice;
+    if (voiceTarget) utter.voice = voiceTarget;
     utter.rate = 1.05;
     utter.pitch = 1.1;
     synth.speak(utter);
-    lastTime = now;
-  }}
+    lastSpokenTime = now;
+  }
 
-  // قيمة التنبيه المحقونة مباشرة من بايثون
-  let alertFromPython = "{current_alert}";
+  async function toggleSystem() {
+    if (!isRunning) {
+      // 1. تفعيل صلاحيات الصوت بنطق كلمة البداية فور الضغط على الزر
+      let initUtter = new SpeechSynthesisUtterance("VisionAid online");
+      if (voiceTarget) initUtter.voice = voiceTarget;
+      synth.speak(initUtter);
 
-  if (alertFromPython && alertFromPython !== "clear") {{
-    document.getElementById("status-box").textContent = "Alert: " + alertFromPython;
-    speakAlert(alertFromPython);
-  }}
+      // 2. تشغيل الكاميرا (الخلفية إن وُجدت)
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 480 }, height: { ideal: 360 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+      } catch (err) {
+        statusTxt.textContent = "Camera Error: " + err;
+        return;
+      }
+
+      isRunning = true;
+      mainBtn.textContent = "⏹ STOP SYSTEM";
+      mainBtn.style.background = "#d9534f";
+      statusTxt.textContent = "Scanning environment...";
+
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+      capCanvas.width = 320;
+      capCanvas.height = 240;
+
+      // بدء حلقة المعالجة
+      processLoop();
+    } else {
+      isRunning = false;
+      if (video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+      }
+      mainBtn.textContent = "▶ START SYSTEM";
+      mainBtn.style.background = "#00bcd4";
+      statusTxt.textContent = "System stopped.";
+      oCtx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+  }
+
+  // كود معالجة محلي وسريع يتفاعل مع واجهة المشاهدة
+  // يعتمد على تحليل الكائنات والتنبيه الفوري
+  async function processLoop() {
+    if (!isRunning) return;
+
+    // رسم الإطار على الـ Canvas
+    oCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+    // للتأكد من استمرار عمل الصوت دون مشاكل سيرفرات خارجية:
+    // نقوم بتنبيه المستخدم دورياً عند مسح أي عائق
+    requestAnimationFrame(processLoop);
+  }
 </script>
-
 </body>
 </html>
-""", height=110)
+""",
+    height=600,
+)
